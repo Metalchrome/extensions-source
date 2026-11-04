@@ -1,5 +1,3 @@
-build-tachimanga-repo.yml
-100 %
 name: Build Punk Records Tachimanga Repo
 
 on:
