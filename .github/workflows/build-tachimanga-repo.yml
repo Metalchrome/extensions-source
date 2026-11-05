@@ -48,7 +48,7 @@ jobs:
 
           keiyoushi {
               name = "Punk Records"
-              versionCode = 2
+              versionCode = 3
               contentWarning = ContentWarning.SAFE
               libVersion = "1.4"
 
@@ -74,6 +74,7 @@ jobs:
           import okhttp3.HttpUrl.Companion.toHttpUrl
           import okhttp3.Request
           import okhttp3.Response
+          import org.json.JSONObject
           import org.jsoup.Jsoup
           import org.jsoup.nodes.Document
           import java.text.SimpleDateFormat
@@ -207,7 +208,7 @@ jobs:
 
               override fun chapterListRequest(manga: SManga): Request {
                   val mangaSlug = manga.url.trim('/').substringAfterLast('/')
-                  return GET("$baseUrl/api/mangas/$mangaSlug/browse?page=1&perPage=2000&sort=recent", headers)
+                  return GET("$baseUrl/api/mangas/$mangaSlug/browse?page=1&sort=recent", headers)
               }
 
               override fun chapterListParse(response: Response): List<SChapter> {
@@ -223,26 +224,17 @@ jobs:
                   val allChapters = mutableListOf<SChapter>()
                   allChapters.addAll(parseChaptersFromBrowseJson(firstPageJson, mangaSlug))
 
-                  val totalPages = TOTAL_PAGES_REGEX.find(firstPageJson)
-                      ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+                  val totalPages = runCatching {
+                      JSONObject(firstPageJson).optInt("totalPages", 1)
+                  }.getOrDefault(1)
 
                   if (totalPages > 1) {
-                      val executor = Executors.newFixedThreadPool(6)
+                      val executor = Executors.newFixedThreadPool(3)
                       try {
                           val futures = (2..totalPages).map { pageNum ->
                               executor.submit(
                                   Callable {
-                                      val pageReq = GET(
-                                          "$baseUrl/api/mangas/$mangaSlug/browse?page=$pageNum&perPage=2000&sort=recent",
-                                          headers,
-                                      )
-                                      client.newCall(pageReq).execute().use { pageResp ->
-                                          if (pageResp.isSuccessful) {
-                                              parseChaptersFromBrowseJson(pageResp.body.string(), mangaSlug)
-                                          } else {
-                                              emptyList()
-                                          }
-                                      }
+                                      fetchBrowsePageWithRetry(mangaSlug, pageNum)
                                   },
                               )
                           }
@@ -330,44 +322,69 @@ jobs:
                       .toList()
               }
 
+              private fun fetchBrowsePageWithRetry(mangaSlug: String, pageNum: Int): List<SChapter> {
+                  repeat(3) { attempt ->
+                      val pageReq = GET(
+                          "$baseUrl/api/mangas/$mangaSlug/browse?page=$pageNum&sort=recent",
+                          headers,
+                      )
+                      val result = runCatching {
+                          client.newCall(pageReq).execute().use { pageResp ->
+                              if (pageResp.isSuccessful) {
+                                  parseChaptersFromBrowseJson(pageResp.body.string(), mangaSlug)
+                              } else {
+                                  null
+                              }
+                          }
+                      }.getOrNull()
+
+                      if (result != null) {
+                          return result
+                      }
+                      runCatching { Thread.sleep(200L * (attempt + 1)) }
+                  }
+                  return emptyList()
+              }
+
               private fun parseChaptersFromBrowseJson(jsonStr: String, mangaSlug: String): List<SChapter> {
-                  val chaptersBlock = CHAPTERS_ARRAY_REGEX.find(jsonStr)?.groupValues?.getOrNull(1)
-                      ?: jsonStr
+                  return runCatching {
+                      val root = JSONObject(jsonStr)
+                      val arr = root.optJSONArray("chapters") ?: return emptyList()
+                      val list = ArrayList<SChapter>(arr.length())
+                      for (i in 0 until arr.length()) {
+                          val obj = arr.optJSONObject(i) ?: continue
+                          val chapSlug = obj.optString("slug", "").trim()
+                          if (chapSlug.isEmpty()) continue
+                          val numDouble = obj.optDouble("number", Double.NaN)
+                          val numFloat = if (!numDouble.isNaN()) {
+                              numDouble.toFloat()
+                          } else {
+                              chapSlug.toFloatOrNull() ?: -1f
+                          }
+                          val chapTitle = if (obj.isNull("title")) "" else obj.optString("title", "").trim()
+                          val publishedAt = if (obj.isNull("publishedAt")) "" else obj.optString("publishedAt", "")
 
-                  return JSON_OBJECT_REGEX.findAll(chaptersBlock)
-                      .mapNotNull { match ->
-                          val obj = match.value
-                          val chapSlug = SLUG_FIELD_REGEX.find(obj)?.groupValues?.getOrNull(1)
-                              ?: return@mapNotNull null
-                          val chapNumStr = NUMBER_FIELD_REGEX.find(obj)?.groupValues?.getOrNull(1)
-                              ?: chapSlug
-                          val rawTitle = TITLE_FIELD_REGEX.find(obj)?.groupValues?.getOrNull(1).orEmpty()
-                          val chapTitle = unescapeJsonText(rawTitle).trim()
-                          val publishedAt = PUBLISHED_AT_FIELD_REGEX.find(obj)?.groupValues?.getOrNull(1)
-
-                          val numFloat = chapNumStr.toFloatOrNull()
-                              ?: chapSlug.toFloatOrNull()
-                              ?: -1f
-
-                          val displayNum = chapSlug.ifEmpty { chapNumStr }
                           val formattedName = if (
                               chapTitle.isNotEmpty() &&
-                              !chapTitle.equals("Chapitre $displayNum", ignoreCase = true) &&
-                              !chapTitle.equals(displayNum, ignoreCase = true)
+                              !chapTitle.equals("Chapitre $chapSlug", ignoreCase = true) &&
+                              !chapTitle.equals(chapSlug, ignoreCase = true)
                           ) {
-                              "Chapitre $displayNum - $chapTitle"
+                              "Chapitre $chapSlug - $chapTitle"
                           } else {
-                              "Chapitre $displayNum"
+                              "Chapitre $chapSlug"
                           }
 
-                          SChapter.create().apply {
-                              url = "/$mangaSlug/$displayNum"
-                              name = formattedName
-                              chapter_number = numFloat
-                              date_upload = parseIsoDate(publishedAt)
-                          }
+                          list.add(
+                              SChapter.create().apply {
+                                  url = "/$mangaSlug/$chapSlug"
+                                  name = formattedName
+                                  chapter_number = numFloat
+                                  date_upload = parseIsoDate(publishedAt)
+                              },
+                          )
                       }
-                      .toList()
+                      list
+                  }.getOrDefault(emptyList())
               }
 
               private fun extractNextRscPayload(doc: Document): String {
@@ -421,23 +438,6 @@ jobs:
                       "\"url\"\\s*:\\s*\"(https?://[^\"]+/chapters/[^\"]+/pages/[^\"]+)\""
                   )
 
-                  private val CHAPTERS_ARRAY_REGEX = Regex(
-                      "\"chapters\"\\s*:\\s*\\[(.*?)\\]",
-                      RegexOption.DOT_MATCHES_ALL,
-                  )
-
-                  private val JSON_OBJECT_REGEX = Regex("\\{[^{}]+\\}")
-
-                  private val TOTAL_PAGES_REGEX = Regex("\"totalPages\"\\s*:\\s*(\\d+)")
-
-                  private val SLUG_FIELD_REGEX = Regex("\"slug\"\\s*:\\s*\"([^\"]+)\"")
-
-                  private val NUMBER_FIELD_REGEX = Regex("\"number\"\\s*:\\s*([0-9.]+)")
-
-                  private val TITLE_FIELD_REGEX = Regex("\"title\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
-
-                  private val PUBLISHED_AT_FIELD_REGEX = Regex("\"publishedAt\"\\s*:\\s*\"([^\"]+)\"")
-
                   private val MANGA_OBJECT_REGEX = Regex(
                       "\"slug\"\\s*:\\s*\"([a-z0-9-]+)\"\\s*,\\s*\"title\"\\s*:\\s*\"([^\"]+)\"[^}]*?\"cover\"\\s*:\\s*\"([^\"]+)\""
                   )
@@ -467,46 +467,4 @@ jobs:
       - name: Build Punk Records APK
         env:
           KEYSTORE_PATH: ${{ github.workspace }}/signing.jks
-          KEYSTORE_PASSPHRASE: android
-          KEY_ALIAS: extension
-          KEY_PASSPHRASE: android
-        run: |
-          chmod +x gradlew
-          ./gradlew :src:fr:punkrecords:assembleRelease -x spotlessCheck -x lintRelease
-
-      - name: Prepare Tachimanga Repo Index
-        run: |
-          mkdir -p repo/apk
-          APK_FILE=$(find src/fr/punkrecords/build/outputs/apk/release -name "*.apk" | head -n 1)
-          APK_NAME="tachiyomi-fr.punkrecords-v1.4.2.apk"
-          cp "$APK_FILE" "repo/apk/$APK_NAME"
-          cp "$APK_FILE" "repo/apk/tachiyomi-fr.punkrecords-v1.4.1.apk"
-
-          cat <<EOF > repo/index.min.json
-          [
-            {
-              "name": "Tachiyomi: Punk Records",
-              "pkg": "eu.kanade.tachiyomi.extension.fr.punkrecords",
-              "apk": "$APK_NAME",
-              "lang": "fr",
-              "code": 2,
-              "version": "1.4.2",
-              "nsfw": 0,
-              "sources": [
-                {
-                  "name": "Punk Records",
-                  "lang": "fr",
-                  "id": "1462847678989634466",
-                  "baseUrl": "https://punkrecordz.com"
-                }
-              ]
-            }
-          ]
-          EOF
-
-      - name: Publish to repo branch
-        uses: peaceiris/actions-gh-pages@v4
-        with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: ./repo
-          publish_branch: repo
+          KEYSTORE_PA
