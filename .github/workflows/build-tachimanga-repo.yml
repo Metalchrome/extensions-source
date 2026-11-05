@@ -467,4 +467,48 @@ jobs:
       - name: Build Punk Records APK
         env:
           KEYSTORE_PATH: ${{ github.workspace }}/signing.jks
-          KEYSTORE_PA
+          KEYSTORE_PASSPHRASE: android
+          KEY_ALIAS: extension
+          KEY_PASSPHRASE: android
+        run: |
+          chmod +x gradlew
+          ./gradlew :src:fr:punkrecords:assembleRelease -x spotlessCheck -x lintRelease
+
+      - name: Prepare Tachimanga Repo Index
+        run: |
+          mkdir -p repo/apk
+          APK_FILE=$(find src/fr/punkrecords/build/outputs/apk/release -name "*.apk" | head -n 1)
+          APK_NAME="tachiyomi-fr.punkrecords-v1.4.3.apk"
+          cp "$APK_FILE" "repo/apk/$APK_NAME"
+          cp "$APK_FILE" "repo/apk/tachiyomi-fr.punkrecords-v1.4.2.apk"
+          cp "$APK_FILE" "repo/apk/tachiyomi-fr.punkrecords-v1.4.1.apk"
+
+          cat <<EOF > repo/index.min.json
+          [
+            {
+              "name": "Tachiyomi: Punk Records",
+              "pkg": "eu.kanade.tachiyomi.extension.fr.punkrecords",
+              "apk": "$APK_NAME",
+              "lang": "fr",
+              "code": 3,
+              "version": "1.4.3",
+              "nsfw": 0,
+              "sources": [
+                {
+                  "name": "Punk Records",
+                  "lang": "fr",
+                  "id": "1462847678989634466",
+                  "baseUrl": "https://punkrecordz.com"
+                }
+              ]
+            }
+          ]
+          EOF
+
+      - name: Publish to repo branch
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./repo
+          publish_branch: repo 
+    
