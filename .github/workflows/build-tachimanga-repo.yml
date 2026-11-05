@@ -26,23 +26,19 @@ jobs:
 
       - name: Prepare module files, icons & 1.4 build logic
         run: |
-          # 1. Copier un jeu d'icônes valide avant de nettoyer src/
           SAMPLE_RES=$(find src -maxdepth 3 -name "res" -type d | head -n 1)
           cp -r "$SAMPLE_RES" /tmp/sample_res
           rm -f /tmp/sample_res/web_hi_res_512.png
 
-          # 2. Restaurer le support de libVersion 1.4 (supprimé dans #20015) pour Tachimanga iOS
           COMMIT_20015=$(git log --grep="20015" -n 1 --format="%H" || true)
           if [ -n "$COMMIT_20015" ]; then
             git checkout "${COMMIT_20015}~1" -- compiler common core gradle build.gradle.kts settings.gradle.kts gradle.properties
           fi
 
-          # 3. Ne garder que src/fr/punkrecords dans src/ (sans toucher à settings.gradle.kts)
           rm -rf src/*
           mkdir -p src/fr/punkrecords/src/eu/kanade/tachiyomi/extension/fr/punkrecords
           cp -r /tmp/sample_res src/fr/punkrecords/res
 
-          # 4. Écrire build.gradle.kts
           cat << 'EOF' > src/fr/punkrecords/build.gradle.kts
           import io.github.keiyoushi.gradle.api.ContentWarning
 
@@ -52,7 +48,7 @@ jobs:
 
           keiyoushi {
               name = "Punk Records"
-              versionCode = 1
+              versionCode = 2
               contentWarning = ContentWarning.SAFE
               libVersion = "1.4"
 
@@ -63,7 +59,6 @@ jobs:
           }
           EOF
 
-          # 5. Écrire PunkRecords.kt
           cat << 'EOF' > src/fr/punkrecords/src/eu/kanade/tachiyomi/extension/fr/punkrecords/PunkRecords.kt
           package eu.kanade.tachiyomi.extension.fr.punkrecords
 
@@ -84,6 +79,8 @@ jobs:
           import java.text.SimpleDateFormat
           import java.util.Locale
           import java.util.TimeZone
+          import java.util.concurrent.Callable
+          import java.util.concurrent.Executors
 
           @Source
           abstract class PunkRecords : HttpSource() {
@@ -208,29 +205,56 @@ jobs:
 
               // ============================== Chapters ==============================
 
-              override fun chapterListParse(response: Response): List<SChapter> {
-                  val doc = response.asJsoupDoc()
-                  val rsc = extractNextRscPayload(doc)
-                  val mangaSlug = response.request.url.pathSegments.lastOrNull().orEmpty()
+              override fun chapterListRequest(manga: SManga): Request {
+                  val mangaSlug = manga.url.trim('/').substringAfterLast('/')
+                  return GET("$baseUrl/api/mangas/$mangaSlug/browse?page=1&perPage=2000&sort=recent", headers)
+              }
 
-                  val chaptersFromRsc = parseChaptersFromRsc(rsc, mangaSlug)
-                  if (chaptersFromRsc.isNotEmpty()) {
-                      return chaptersFromRsc.sortedByDescending { it.chapter_number }
+              override fun chapterListParse(response: Response): List<SChapter> {
+                  val requestUrl = response.request.url
+                  val pathSegments = requestUrl.pathSegments
+                  val mangaSlug = if (pathSegments.size >= 3 && pathSegments[0] == "api" && pathSegments[1] == "mangas") {
+                      pathSegments[2]
+                  } else {
+                      pathSegments.lastOrNull().orEmpty()
                   }
 
-                  return doc.select("a[href^=/$mangaSlug/]")
-                      .mapNotNull { element ->
-                          val href = element.attr("href").trim()
-                          val chapterSlug = href.removePrefix("/$mangaSlug/").trim('/')
-                          if (chapterSlug.isEmpty() || chapterSlug.contains('/')) return@mapNotNull null
+                  val firstPageJson = response.body.string()
+                  val allChapters = mutableListOf<SChapter>()
+                  allChapters.addAll(parseChaptersFromBrowseJson(firstPageJson, mangaSlug))
 
-                          val numFloat = chapterSlug.toFloatOrNull() ?: -1f
-                          SChapter.create().apply {
-                              url = href
-                              chapter_number = numFloat
-                              name = "Chapitre $chapterSlug"
+                  val totalPages = TOTAL_PAGES_REGEX.find(firstPageJson)
+                      ?.groupValues?.getOrNull(1)?.toIntOrNull() ?: 1
+
+                  if (totalPages > 1) {
+                      val executor = Executors.newFixedThreadPool(6)
+                      try {
+                          val futures = (2..totalPages).map { pageNum ->
+                              executor.submit(
+                                  Callable {
+                                      val pageReq = GET(
+                                          "$baseUrl/api/mangas/$mangaSlug/browse?page=$pageNum&perPage=2000&sort=recent",
+                                          headers,
+                                      )
+                                      client.newCall(pageReq).execute().use { pageResp ->
+                                          if (pageResp.isSuccessful) {
+                                              parseChaptersFromBrowseJson(pageResp.body.string(), mangaSlug)
+                                          } else {
+                                              emptyList()
+                                          }
+                                      }
+                                  },
+                              )
                           }
+                          for (future in futures) {
+                              runCatching { allChapters.addAll(future.get()) }
+                          }
+                      } finally {
+                          executor.shutdown()
                       }
+                  }
+
+                  return allChapters
                       .distinctBy { it.url }
                       .sortedByDescending { it.chapter_number }
               }
@@ -306,13 +330,20 @@ jobs:
                       .toList()
               }
 
-              private fun parseChaptersFromRsc(rsc: String, mangaSlug: String): List<SChapter> {
-                  return CHAPTER_OBJECT_REGEX.findAll(rsc)
-                      .map { match ->
-                          val chapSlug = match.groupValues[1]
-                          val chapNumStr = match.groupValues[2]
-                          val chapTitle = unescapeJsonText(match.groupValues[3]).trim()
-                          val publishedAt = match.groupValues[4]
+              private fun parseChaptersFromBrowseJson(jsonStr: String, mangaSlug: String): List<SChapter> {
+                  val chaptersBlock = CHAPTERS_ARRAY_REGEX.find(jsonStr)?.groupValues?.getOrNull(1)
+                      ?: jsonStr
+
+                  return JSON_OBJECT_REGEX.findAll(chaptersBlock)
+                      .mapNotNull { match ->
+                          val obj = match.value
+                          val chapSlug = SLUG_FIELD_REGEX.find(obj)?.groupValues?.getOrNull(1)
+                              ?: return@mapNotNull null
+                          val chapNumStr = NUMBER_FIELD_REGEX.find(obj)?.groupValues?.getOrNull(1)
+                              ?: chapSlug
+                          val rawTitle = TITLE_FIELD_REGEX.find(obj)?.groupValues?.getOrNull(1).orEmpty()
+                          val chapTitle = unescapeJsonText(rawTitle).trim()
+                          val publishedAt = PUBLISHED_AT_FIELD_REGEX.find(obj)?.groupValues?.getOrNull(1)
 
                           val numFloat = chapNumStr.toFloatOrNull()
                               ?: chapSlug.toFloatOrNull()
@@ -336,7 +367,6 @@ jobs:
                               date_upload = parseIsoDate(publishedAt)
                           }
                       }
-                      .distinctBy { it.url }
                       .toList()
               }
 
@@ -372,6 +402,7 @@ jobs:
 
               private fun unescapeJsonText(input: String): String {
                   return input
+                      .replace("\\\"", "\"")
                       .replace("\\u0026", "&")
                       .replace("\\u0027", "'")
                       .replace("\\u003c", "<")
@@ -390,9 +421,22 @@ jobs:
                       "\"url\"\\s*:\\s*\"(https?://[^\"]+/chapters/[^\"]+/pages/[^\"]+)\""
                   )
 
-                  private val CHAPTER_OBJECT_REGEX = Regex(
-                      "\"slug\"\\s*:\\s*\"([^\"]+)\"\\s*,\\s*\"number\"\\s*:\\s*([0-9.]+)\\s*,\\s*\"title\"\\s*:\\s*(?:\"([^\"]*)\"|null)(?:[^}]*?\"publishedAt\"\\s*:\\s*\"([^\"]+)\")?"
+                  private val CHAPTERS_ARRAY_REGEX = Regex(
+                      "\"chapters\"\\s*:\\s*\\[(.*?)\\]",
+                      RegexOption.DOT_MATCHES_ALL,
                   )
+
+                  private val JSON_OBJECT_REGEX = Regex("\\{[^{}]+\\}")
+
+                  private val TOTAL_PAGES_REGEX = Regex("\"totalPages\"\\s*:\\s*(\\d+)")
+
+                  private val SLUG_FIELD_REGEX = Regex("\"slug\"\\s*:\\s*\"([^\"]+)\"")
+
+                  private val NUMBER_FIELD_REGEX = Regex("\"number\"\\s*:\\s*([0-9.]+)")
+
+                  private val TITLE_FIELD_REGEX = Regex("\"title\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+
+                  private val PUBLISHED_AT_FIELD_REGEX = Regex("\"publishedAt\"\\s*:\\s*\"([^\"]+)\"")
 
                   private val MANGA_OBJECT_REGEX = Regex(
                       "\"slug\"\\s*:\\s*\"([a-z0-9-]+)\"\\s*,\\s*\"title\"\\s*:\\s*\"([^\"]+)\"[^}]*?\"cover\"\\s*:\\s*\"([^\"]+)\""
@@ -434,8 +478,9 @@ jobs:
         run: |
           mkdir -p repo/apk
           APK_FILE=$(find src/fr/punkrecords/build/outputs/apk/release -name "*.apk" | head -n 1)
-          APK_NAME="tachiyomi-fr.punkrecords-v1.4.1.apk"
+          APK_NAME="tachiyomi-fr.punkrecords-v1.4.2.apk"
           cp "$APK_FILE" "repo/apk/$APK_NAME"
+          cp "$APK_FILE" "repo/apk/tachiyomi-fr.punkrecords-v1.4.1.apk"
 
           cat <<EOF > repo/index.min.json
           [
@@ -444,8 +489,8 @@ jobs:
               "pkg": "eu.kanade.tachiyomi.extension.fr.punkrecords",
               "apk": "$APK_NAME",
               "lang": "fr",
-              "code": 1,
-              "version": "1.4.1",
+              "code": 2,
+              "version": "1.4.2",
               "nsfw": 0,
               "sources": [
                 {
